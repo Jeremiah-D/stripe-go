@@ -1406,8 +1406,44 @@ func (s *BackendImplementation) shouldRetry(err error, req *http.Request, resp *
 
 	// All errors from the Stripe API should implement the `retrier` interface.
 	// Any other error comes from a different layer
+	isRetrier := false
 	if err, ok := err.(retrier); ok {
-		return err.canRetry(), "not retriable error"
+		isRetrier = true
+		if err.canRetry() {
+			return true, ""
+		}
+		// A retrier that declines to retry doesn't get the final word: the
+		// API may still ask for (or against) a retry through the response,
+		// so fall through to the response-level checks below. Note that
+		// (*Error).canRetry only covers 429 lock timeouts; without this
+		// fallthrough, the Stripe-Should-Retry header, 409, and >= 500
+		// checks would be unreachable for every API error.
+	}
+
+	// The API may ask us not to retry (e.g. if doing so would be a no-op), or
+	// advise us to retry (e.g. in cases of lock timeouts). Defer to those
+	// instructions if given.
+	if resp != nil {
+		if resp.Header.Get("Stripe-Should-Retry") == "false" {
+			return false, "`Stripe-Should-Retry` header returned `false`"
+		}
+		if resp.Header.Get("Stripe-Should-Retry") == "true" {
+			return true, ""
+		}
+
+		// 409 Conflict
+		if resp.StatusCode == http.StatusConflict {
+			return true, ""
+		}
+
+		// Retry on 500, 503, and other internal errors.
+		//
+		// Note that we expect the stripe-should-retry header to be false
+		// in most cases when a 500 is returned, since our idempotency framework
+		// would typically replay it anyway.
+		if resp.StatusCode >= http.StatusInternalServerError {
+			return true, ""
+		}
 	}
 
 	// We retry most errors that come out of HTTP requests except for a curated
@@ -1415,8 +1451,10 @@ func (s *BackendImplementation) shouldRetry(err error, req *http.Request, resp *
 	// exhaustive, so it'd be okay to add new errors to it. It'd also be okay to
 	// flip this to an inverted strategy of retrying only errors that we know
 	// to be retryable in a future refactor, if a good methodology is found for
-	// identifying that full set of errors.
-	if err != nil {
+	// identifying that full set of errors. (A retrier that declined above is
+	// not treated as a generic retryable error: its verdict stands unless a
+	// response-level signal said otherwise.)
+	if err != nil && !isRetrier {
 		if urlErr, ok := err.(*url.Error); ok {
 			// Don't retry too many redirects.
 			if redirectsErrorRE.MatchString(urlErr.Error()) {
@@ -1435,30 +1473,6 @@ func (s *BackendImplementation) shouldRetry(err error, req *http.Request, resp *
 		}
 
 		// Do retry every other type of non-Stripe error.
-		return true, ""
-	}
-
-	// The API may ask us not to retry (e.g. if doing so would be a no-op), or
-	// advise us to retry (e.g. in cases of lock timeouts). Defer to those
-	// instructions if given.
-	if resp.Header.Get("Stripe-Should-Retry") == "false" {
-		return false, "`Stripe-Should-Retry` header returned `false`"
-	}
-	if resp.Header.Get("Stripe-Should-Retry") == "true" {
-		return true, ""
-	}
-
-	// 409 Conflict
-	if resp.StatusCode == http.StatusConflict {
-		return true, ""
-	}
-
-	// Retry on 500, 503, and other internal errors.
-	//
-	// Note that we expect the stripe-should-retry header to be false
-	// in most cases when a 500 is returned, since our idempotency framework
-	// would typically replay it anyway.
-	if resp.StatusCode >= http.StatusInternalServerError {
 		return true, ""
 	}
 

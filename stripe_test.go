@@ -334,6 +334,76 @@ func TestShouldRetry(t *testing.T) {
 		)
 		assert.True(t, shouldRetry)
 	})
+
+	// 503 Service Unavailable with a real *stripe.Error (the production
+	// path: every >= 400 response becomes a non-nil *stripe.Error, whose
+	// canRetry only covers 429 lock timeouts). The >= 500 check must still
+	// apply -- see the v78.0.0 changelog.
+	t.Run("RetryOn503ServiceUnavailableWithStripeError", func(t *testing.T) {
+		shouldRetry, _ := c.shouldRetry(
+			&Error{HTTPStatusCode: http.StatusServiceUnavailable},
+			&http.Request{},
+			&http.Response{StatusCode: http.StatusServiceUnavailable},
+			0,
+		)
+		assert.True(t, shouldRetry)
+	})
+
+	// `Stripe-Should-Retry: true` with a real *stripe.Error: the API's
+	// explicit instruction must win over canRetry's verdict.
+	t.Run("RetryOnStripeRetryHeaderTrueWithStripeError", func(t *testing.T) {
+		shouldRetry, _ := c.shouldRetry(
+			&Error{HTTPStatusCode: http.StatusBadRequest},
+			&http.Request{},
+			&http.Response{
+				Header: http.Header(map[string][]string{
+					"Stripe-Should-Retry": {"true"},
+				}),
+				StatusCode: http.StatusBadRequest,
+			},
+			0,
+		)
+		assert.True(t, shouldRetry)
+	})
+
+	// `Stripe-Should-Retry: false` with a real *stripe.Error: the API's
+	// explicit instruction not to retry is honored.
+	t.Run("DontRetryOnStripeRetryHeaderFalseWithStripeError", func(t *testing.T) {
+		shouldRetry, _ := c.shouldRetry(
+			&Error{HTTPStatusCode: http.StatusServiceUnavailable},
+			&http.Request{},
+			&http.Response{
+				Header: http.Header(map[string][]string{
+					"Stripe-Should-Retry": {"false"},
+				}),
+				StatusCode: http.StatusServiceUnavailable,
+			},
+			0,
+		)
+		assert.False(t, shouldRetry)
+	})
+
+	// 409 Conflict with a real *stripe.Error.
+	t.Run("RetryOn409ConflictWithStripeError", func(t *testing.T) {
+		shouldRetry, _ := c.shouldRetry(
+			&Error{HTTPStatusCode: http.StatusConflict},
+			&http.Request{},
+			&http.Response{StatusCode: http.StatusConflict},
+			0,
+		)
+		assert.True(t, shouldRetry)
+	})
+
+	// 400 with a real *stripe.Error and no retry signal: still not retried.
+	t.Run("DontRetryOn400WithStripeError", func(t *testing.T) {
+		shouldRetry, _ := c.shouldRetry(
+			&Error{HTTPStatusCode: http.StatusBadRequest},
+			&http.Request{},
+			&http.Response{StatusCode: http.StatusBadRequest},
+			0,
+		)
+		assert.False(t, shouldRetry)
+	})
 }
 
 func TestDo_RetryOnTimeout(t *testing.T) {
@@ -380,6 +450,60 @@ func TestDo_RetryOnTimeout(t *testing.T) {
 	assert.Error(t, err)
 	// timeout should not prevent retry
 	assert.Equal(t, uint32(2), atomic.LoadUint32(&counter))
+}
+
+// A 503 API error response carrying `Stripe-Should-Retry: true` must be
+// retried. Regression test for https://github.com/stripe/stripe-go/issues/2466:
+// the response becomes a non-nil *stripe.Error, whose canRetry() only covers
+// 429 lock timeouts, and must not shadow the response-level retry signals.
+func TestDo_RetryOn503ServiceUnavailable(t *testing.T) {
+	type testServerResponse struct {
+		APIResource
+		Message string `json:"message"`
+	}
+
+	var counter uint32
+
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint32(&counter, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Stripe-Should-Retry", "true")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"type":"api_error","message":"try again"}}`))
+	}))
+	defer testServer.Close()
+
+	backend := GetBackendWithConfig(
+		APIBackend,
+		&BackendConfig{
+			LeveledLogger:     nullLeveledLogger,
+			MaxNetworkRetries: Int64(2),
+			URL:               String(testServer.URL),
+		},
+	).(*BackendImplementation)
+
+	backend.SetNetworkRetriesSleep(false)
+
+	request, err := backend.NewRequest(
+		http.MethodPost,
+		"/v1/charges",
+		"sk_test_123",
+		"application/x-www-form-urlencoded",
+		nil,
+	)
+	assert.NoError(t, err)
+
+	var response testServerResponse
+	var body = bytes.NewBufferString("foo=bar")
+
+	err = backend.Do(request, body, &response)
+
+	assert.Error(t, err)
+	var stripeErr *Error
+	assert.ErrorAs(t, err, &stripeErr)
+	assert.Equal(t, http.StatusServiceUnavailable, stripeErr.HTTPStatusCode)
+	// 1 initial request + 2 retries
+	assert.Equal(t, uint32(3), atomic.LoadUint32(&counter))
 }
 
 func TestDo_LastResponsePopulated(t *testing.T) {
