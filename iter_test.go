@@ -33,6 +33,26 @@ func TestIterEmptyWithHasMore(t *testing.T) {
 	assert.ErrorIs(t, gerr, errEmptyPageWithHasMore)
 }
 
+func TestIterNullItemWithHasMore(t *testing.T) {
+	tq := testQuery{{[]interface{}{(*item)(nil)}, &ListMeta{HasMore: true}, nil}}
+	g, gerr := collect(GetIter(nil, tq.query))
+	assert.Equal(t, 0, len(tq))
+	assert.Equal(t, 0, len(g))
+	assert.ErrorIs(t, gerr, errNullItemInPage)
+}
+
+func TestIterNullItemOnNextPageWithHasMore(t *testing.T) {
+	tq := testQuery{
+		{[]interface{}{&item{"x"}}, &ListMeta{HasMore: true}, nil},
+		{[]interface{}{(*item)(nil)}, &ListMeta{HasMore: true}, nil},
+	}
+	want := []interface{}{&item{"x"}}
+	g, gerr := collect(GetIter(nil, tq.query))
+	assert.Equal(t, 0, len(tq))
+	assert.Equal(t, want, g)
+	assert.ErrorIs(t, gerr, errNullItemInPage)
+}
+
 func TestIterOne(t *testing.T) {
 	tq := testQuery{{[]interface{}{1}, &ListMeta{}, nil}}
 	want := []interface{}{1}
@@ -186,6 +206,26 @@ func TestV1ListEmptyWithHasMore(t *testing.T) {
 	assert.Equal(t, 0, len(tq))
 	assert.Equal(t, 0, len(g))
 	assert.ErrorIs(t, gerr, errEmptyPageWithHasMore)
+}
+
+func TestV1ListNullItemWithHasMore(t *testing.T) {
+	tq := testV1Query[*item]{{v: &v1Page[*item]{Data: []*item{nil}, ListMeta: ListMeta{HasMore: true}}, e: nil}}
+	g, gerr := collectList(newV1List(context.TODO(), nil, tq.query))
+	assert.Equal(t, 0, len(tq))
+	assert.Equal(t, 0, len(g))
+	assert.ErrorIs(t, gerr, errNullItemInPage)
+}
+
+func TestV1ListNullItemOnNextPageWithHasMore(t *testing.T) {
+	tq := testV1Query[*item]{
+		{v: &v1Page[*item]{Data: []*item{{"x"}}, ListMeta: ListMeta{HasMore: true}}, e: nil},
+		{v: &v1Page[*item]{Data: []*item{nil}, ListMeta: ListMeta{HasMore: true}}, e: nil},
+	}
+	want := []*item{{"x"}}
+	g, gerr := collectList(newV1List(context.TODO(), nil, tq.query))
+	assert.Equal(t, 0, len(tq))
+	assert.Equal(t, want, g)
+	assert.ErrorIs(t, gerr, errNullItemInPage)
 }
 
 func TestV1ListOne(t *testing.T) {
