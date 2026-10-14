@@ -13,6 +13,8 @@ import (
 
 var errEmptyPageWithHasMore = errors.New("stripe: invalid list response: has_more is true but data is empty")
 
+var errNullItemInPage = errors.New("stripe: invalid list response: data contains null item")
+
 // Iter provides a convenient interface
 // for iterating over the elements
 // returned from paginated list API calls.
@@ -86,7 +88,11 @@ func (it *Iter) getPage() {
 	it.values, it.list, it.err = it.query(it.listParams.GetParams(), it.formValues)
 	it.meta = it.list.GetListMeta()
 	if it.err == nil {
-		it.err = validateV1ListPage(len(it.values), it.meta.HasMore, it.listParams.Single)
+		if err := validateV1ListPage(it.values, it.meta.HasMore, it.listParams.Single); err != nil {
+			it.err = err
+			// Don't yield the malformed items.
+			it.values = nil
+		}
 	}
 
 	if it.listParams.EndingBefore != nil {
@@ -209,8 +215,10 @@ func (l *V1List[T]) page(ctx context.Context) {
 		l.err = err
 		return
 	}
-	if err := validateV1ListPage(len(page.Data), page.HasMore, l.listParams.Single); err != nil {
+	if err := validateV1ListPage(page.Data, page.HasMore, l.listParams.Single); err != nil {
 		l.err = err
+		// Don't yield the malformed items.
+		page.Data = nil
 		return
 	}
 	if err := maybeAddLastResponseV1(page); err != nil {
@@ -233,11 +241,33 @@ func (l *V1List[T]) hasMore() bool {
 	return l.v1Page.HasMore && !l.listParams.Single
 }
 
-func validateV1ListPage(dataLen int, hasMore, single bool) error {
-	if dataLen == 0 && hasMore && !single {
+func validateV1ListPage[T any](data []T, hasMore, single bool) error {
+	if len(data) == 0 && hasMore && !single {
 		return errEmptyPageWithHasMore
 	}
+	if hasMore && !single && hasNullItem(data) {
+		return errNullItemInPage
+	}
 	return nil
+}
+
+// hasNullItem reports whether data contains a null item. A JSON null
+// unmarshals to a typed nil pointer, which is not == nil as an interface
+// value, so the check uses reflection.
+func hasNullItem[T any](data []T) bool {
+	for _, item := range data {
+		v := reflect.ValueOf(item)
+		if !v.IsValid() {
+			return true
+		}
+		switch v.Kind() {
+		case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Map, reflect.Chan, reflect.Func:
+			if v.IsNil() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // maybeAddLastResponseV1 adds the LastResponse to the items in the page.
