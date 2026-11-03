@@ -1920,6 +1920,61 @@ func TestIdempotencyKey(t *testing.T) {
 	assert.Equal(t, "idempotency-key", req.Header.Get("Idempotency-Key"))
 }
 
+func TestRawRequestNilParamsSendsIdempotencyKey(t *testing.T) {
+	var keys []string
+	requestNum := 0
+
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+
+		switch requestNum {
+		case 0, 1:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, err := w.Write([]byte(`{"error": {"message": "boom", "type": "api_error"}}`))
+			assert.NoError(t, err)
+
+		case 2:
+			_, err := w.Write([]byte(`{"id": "ch_123"}`))
+			assert.NoError(t, err)
+
+		default:
+			assert.Fail(t, "Should not have reached request %v", requestNum)
+		}
+
+		requestNum++
+	}))
+	defer testServer.Close()
+
+	backend := GetBackendWithConfig(
+		APIBackend,
+		&BackendConfig{
+			LeveledLogger:     nullLeveledLogger,
+			MaxNetworkRetries: Int64(5),
+			URL:               String(testServer.URL),
+		},
+	).(*BackendImplementation)
+
+	// Disable sleeping duration our tests.
+	backend.SetNetworkRetriesSleep(false)
+
+	_, err := backend.RawRequest(
+		http.MethodPost,
+		"/v1/charges",
+		"sk_test_123",
+		"amount=100&currency=usd",
+		nil,
+	)
+	assert.NoError(t, err)
+
+	// Two 500s, then a 200: three attempts in total.
+	assert.Equal(t, 3, len(keys))
+	// Every attempt must carry the same generated key, so a retry can
+	// never replay the charge as a new one.
+	assert.NotEmpty(t, keys[0])
+	assert.Equal(t, keys[0], keys[1])
+	assert.Equal(t, keys[0], keys[2])
+}
+
 func TestNewBackends(t *testing.T) {
 	httpClient := &http.Client{}
 	backends := NewBackends(httpClient)

@@ -896,8 +896,6 @@ func (s *BackendImplementation) NewRequest(method, path, key, contentType string
 			}
 
 			req.Header.Add("Idempotency-Key", idempotencyKey)
-		} else if isHTTPWriteMethod(method) {
-			req.Header.Add("Idempotency-Key", NewIdempotencyKey())
 		}
 
 		if params.StripeAccount != nil {
@@ -915,6 +913,13 @@ func (s *BackendImplementation) NewRequest(method, path, key, contentType string
 				req.Header.Set(k, line)
 			}
 		}
+	}
+
+	// A write without an explicit key still needs one, so a retry can't
+	// replay the request as a new charge. This covers nil params as well
+	// as params without an idempotency key.
+	if req.Header.Get("Idempotency-Key") == "" && isHTTPWriteMethod(method) {
+		req.Header.Add("Idempotency-Key", NewIdempotencyKey())
 	}
 
 	return req, nil
