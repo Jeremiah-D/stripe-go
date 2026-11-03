@@ -2140,8 +2140,15 @@ type requestTelemetry struct {
 
 var appInfo *AppInfo
 var backends Backends
-var encodedStripeUserAgent string
-var encodedStripeUserAgentReady *sync.Once
+
+// encodedStripeUserAgent caches the X-Stripe-Client-User-Agent header value
+// per EnableTelemetry setting: index 0 is telemetry disabled, index 1 is
+// telemetry enabled. Each variant is computed lazily under its own sync.Once,
+// so the first client to make a request does not freeze the header for every
+// other client in the process, and a telemetry-disabled client never triggers
+// getTelemetryID's on-disk ID creation.
+var encodedStripeUserAgent [2]string
+var encodedStripeUserAgentReady [2]*sync.Once
 var encodedUserAgent string
 
 // The default HTTP client used for communication with any of Stripe's
@@ -2209,33 +2216,41 @@ func initUserAgent() {
 	if agent, ok := detectAIAgent(os.LookupEnv); ok {
 		encodedUserAgent += " AIAgent/" + agent
 	}
-	encodedStripeUserAgentReady = &sync.Once{}
+	encodedStripeUserAgentReady = [2]*sync.Once{new(sync.Once), new(sync.Once)}
 }
 
 func getEncodedStripeUserAgent(enableTelemetry bool) string {
-	encodedStripeUserAgentReady.Do(func() {
-		stripeUserAgent := &stripeClientUserAgent{
-			Application:     appInfo,
-			BindingsVersion: clientversion,
-			Language:        "go",
-			LanguageVersion: runtime.Version(),
-		}
-		if enableTelemetry {
-			stripeUserAgent.Platform = runtime.GOOS + " " + runtime.GOARCH
-			stripeUserAgent.TelemetryID = getTelemetryID()
-		}
-		if agent, ok := detectAIAgent(os.LookupEnv); ok {
-			stripeUserAgent.AIAgent = agent
-		}
-		marshaled, err := json.Marshal(stripeUserAgent)
-		// Encoding this struct should never be a problem, so we're okay to panic
-		// in case it is for some reason.
-		if err != nil {
-			panic(err)
-		}
-		encodedStripeUserAgent = string(marshaled)
+	index := 0
+	if enableTelemetry {
+		index = 1
+	}
+	encodedStripeUserAgentReady[index].Do(func() {
+		encodedStripeUserAgent[index] = encodeStripeUserAgent(enableTelemetry)
 	})
-	return encodedStripeUserAgent
+	return encodedStripeUserAgent[index]
+}
+
+func encodeStripeUserAgent(enableTelemetry bool) string {
+	stripeUserAgent := &stripeClientUserAgent{
+		Application:     appInfo,
+		BindingsVersion: clientversion,
+		Language:        "go",
+		LanguageVersion: runtime.Version(),
+	}
+	if enableTelemetry {
+		stripeUserAgent.Platform = runtime.GOOS + " " + runtime.GOARCH
+		stripeUserAgent.TelemetryID = getTelemetryID()
+	}
+	if agent, ok := detectAIAgent(os.LookupEnv); ok {
+		stripeUserAgent.AIAgent = agent
+	}
+	marshaled, err := json.Marshal(stripeUserAgent)
+	// Encoding this struct should never be a problem, so we're okay to panic
+	// in case it is for some reason.
+	if err != nil {
+		panic(err)
+	}
+	return string(marshaled)
 }
 
 func isHTTPWriteMethod(method string) bool {

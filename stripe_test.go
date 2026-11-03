@@ -2230,7 +2230,7 @@ func TestStripeClientUserAgentWithAIAgent(t *testing.T) {
 	}()
 
 	// Reset so getEncodedStripeUserAgent re-computes
-	encodedStripeUserAgentReady = &sync.Once{}
+	encodedStripeUserAgentReady = [2]*sync.Once{new(sync.Once), new(sync.Once)}
 
 	encoded := getEncodedStripeUserAgent(true)
 	var userAgent map[string]interface{}
@@ -2255,7 +2255,7 @@ func TestStripeClientUserAgentOmitsPlatformWithoutTelemetry(t *testing.T) {
 		encodedStripeUserAgentReady = originalReady
 	}()
 
-	encodedStripeUserAgentReady = &sync.Once{}
+	encodedStripeUserAgentReady = [2]*sync.Once{new(sync.Once), new(sync.Once)}
 
 	encoded := getEncodedStripeUserAgent(false)
 	var userAgent map[string]string
@@ -2277,7 +2277,7 @@ func TestStripeClientUserAgentContainsTelemetryID(t *testing.T) {
 
 	resetTelemetryID()
 	configDirOverride = t.TempDir()
-	encodedStripeUserAgentReady = &sync.Once{}
+	encodedStripeUserAgentReady = [2]*sync.Once{new(sync.Once), new(sync.Once)}
 
 	encoded := getEncodedStripeUserAgent(true)
 	var userAgent map[string]interface{}
@@ -2304,7 +2304,7 @@ func TestStripeClientUserAgentOmitsTelemetryIDWhenDisabled(t *testing.T) {
 	}()
 
 	resetTelemetryID()
-	encodedStripeUserAgentReady = &sync.Once{}
+	encodedStripeUserAgentReady = [2]*sync.Once{new(sync.Once), new(sync.Once)}
 
 	encoded := getEncodedStripeUserAgent(false)
 	var userAgent map[string]interface{}
@@ -2313,6 +2313,74 @@ func TestStripeClientUserAgentOmitsTelemetryIDWhenDisabled(t *testing.T) {
 
 	_, ok := userAgent["telemetry_id"]
 	assert.False(t, ok, "expected 'telemetry_id' field to be absent from X-Stripe-Client-User-Agent when telemetry is disabled")
+}
+
+func TestUserAgentTelemetryPerClient(t *testing.T) {
+	// Two clients in one process with opposite EnableTelemetry settings
+	// must each get their own X-Stripe-Client-User-Agent: the first client
+	// to make a request must not decide the header for the other one.
+	// Regression test for #2486.
+	originalEncoded := encodedStripeUserAgent
+	originalReady := encodedStripeUserAgentReady
+	defer func() {
+		encodedStripeUserAgent = originalEncoded
+		encodedStripeUserAgentReady = originalReady
+		resetTelemetryID()
+	}()
+
+	resetTelemetryID()
+	configDirOverride = t.TempDir()
+
+	telemetryBackend := GetBackendWithConfig(
+		APIBackend,
+		&BackendConfig{
+			LeveledLogger:   nullLeveledLogger,
+			EnableTelemetry: Bool(true),
+			URL:             String("http://localhost"),
+		},
+	).(*BackendImplementation)
+	noTelemetryBackend := GetBackendWithConfig(
+		APIBackend,
+		&BackendConfig{
+			LeveledLogger:   nullLeveledLogger,
+			EnableTelemetry: Bool(false),
+			URL:             String("http://localhost"),
+		},
+	).(*BackendImplementation)
+
+	userAgentOf := func(t *testing.T, b *BackendImplementation) map[string]string {
+		t.Helper()
+		req, err := b.NewRequest(http.MethodGet, "/v1/hello", "sk_test_123", "", nil)
+		assert.NoError(t, err)
+		var userAgent map[string]string
+		err = json.Unmarshal([]byte(req.Header.Get("X-Stripe-Client-User-Agent")), &userAgent)
+		assert.NoError(t, err)
+		return userAgent
+	}
+
+	// Exercise both orders, with a fresh cache each time so the first
+	// request is the one that would previously have frozen the header.
+	for _, telemetryFirst := range []bool{true, false} {
+		encodedStripeUserAgentReady = [2]*sync.Once{new(sync.Once), new(sync.Once)}
+		first, second := telemetryBackend, noTelemetryBackend
+		if !telemetryFirst {
+			first, second = second, first
+		}
+
+		uaFirst := userAgentOf(t, first)
+		uaSecond := userAgentOf(t, second)
+
+		uaTelemetry := uaFirst
+		uaNoTelemetry := uaSecond
+		if !telemetryFirst {
+			uaTelemetry, uaNoTelemetry = uaSecond, uaFirst
+		}
+
+		assert.NotEmpty(t, uaTelemetry["telemetry_id"], "telemetry-enabled client should send telemetry_id (telemetryFirst=%v)", telemetryFirst)
+		assert.NotEmpty(t, uaTelemetry["platform"], "telemetry-enabled client should send platform (telemetryFirst=%v)", telemetryFirst)
+		assert.Empty(t, uaNoTelemetry["telemetry_id"], "telemetry-disabled client should not send telemetry_id (telemetryFirst=%v)", telemetryFirst)
+		assert.Empty(t, uaNoTelemetry["platform"], "telemetry-disabled client should not send platform (telemetryFirst=%v)", telemetryFirst)
+	}
 }
 
 func TestResponseToError(t *testing.T) {
